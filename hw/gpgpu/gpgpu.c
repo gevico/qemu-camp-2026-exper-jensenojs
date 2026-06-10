@@ -22,23 +22,183 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
-/* TODO: Implement MMIO control register read */
+static void gpgpu_reset(DeviceState *dev);
+
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
     (void)size;
+    GPGPUState *s = opaque;
+
+    switch (addr) {
+    case GPGPU_REG_DEV_ID:
+        return GPGPU_DEV_ID_VALUE;
+    case GPGPU_REG_DEV_VERSION:
+        return GPGPU_DEV_VERSION_VALUE;
+    case GPGPU_REG_DEV_CAPS:
+        return (s->num_cus & 0xff) |
+               ((s->warps_per_cu & 0xff) << 8) |
+               ((s->warp_size & 0xff) << 16);
+    case GPGPU_REG_VRAM_SIZE_LO:
+        return (uint32_t)s->vram_size;
+    case GPGPU_REG_VRAM_SIZE_HI:
+        return (uint32_t)(s->vram_size >> 32);
+
+    case GPGPU_REG_GLOBAL_CTRL:
+        return s->global_ctrl;
+    case GPGPU_REG_GLOBAL_STATUS:
+        return s->global_status;
+    case GPGPU_REG_ERROR_STATUS:
+        return s->error_status;
+
+    case GPGPU_REG_IRQ_ENABLE:
+        return s->irq_enable;
+    case GPGPU_REG_IRQ_STATUS:
+        return s->irq_status;
+
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        return (uint32_t)s->kernel.kernel_addr;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        return (uint32_t)s->kernel.kernel_args;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        return (uint32_t)(s->kernel.kernel_args >> 32);
+    case GPGPU_REG_GRID_DIM_X:
+        return s->kernel.grid_dim[0];
+    case GPGPU_REG_GRID_DIM_Y:
+        return s->kernel.grid_dim[1];
+    case GPGPU_REG_GRID_DIM_Z:
+        return s->kernel.grid_dim[2];
+    case GPGPU_REG_BLOCK_DIM_X:
+        return s->kernel.block_dim[0];
+    case GPGPU_REG_BLOCK_DIM_Y:
+        return s->kernel.block_dim[1];
+    case GPGPU_REG_BLOCK_DIM_Z:
+        return s->kernel.block_dim[2];
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        return s->kernel.shared_mem_size;
+
+    case GPGPU_REG_DMA_SRC_LO:
+        return (uint32_t)s->dma.src_addr;
+    case GPGPU_REG_DMA_SRC_HI:
+        return (uint32_t)(s->dma.src_addr >> 32);
+    case GPGPU_REG_DMA_DST_LO:
+        return (uint32_t)s->dma.dst_addr;
+    case GPGPU_REG_DMA_DST_HI:
+        return (uint32_t)(s->dma.dst_addr >> 32);
+    case GPGPU_REG_DMA_SIZE:
+        return s->dma.size;
+    case GPGPU_REG_DMA_CTRL:
+        return s->dma.ctrl;
+    case GPGPU_REG_DMA_STATUS:
+        return s->dma.status;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "gpgpu: invalid ctrl read at 0x%" HWADDR_PRIx "\n",
+                  addr);
     return 0;
 }
 
-/* TODO: Implement MMIO control register write */
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
     (void)size;
+    GPGPUState *s = opaque;
+
+    switch (addr) {
+    case GPGPU_REG_GLOBAL_CTRL:
+        if (val & GPGPU_CTRL_RESET) {
+            gpgpu_reset(DEVICE(s));
+            return;
+        }
+        s->global_ctrl = val & GPGPU_CTRL_ENABLE;
+        return;
+    case GPGPU_REG_ERROR_STATUS:
+        s->error_status &= ~(val & (GPGPU_ERR_INVALID_CMD |
+                                    GPGPU_ERR_VRAM_FAULT |
+                                    GPGPU_ERR_KERNEL_FAULT |
+                                    GPGPU_ERR_DMA_FAULT));
+        return;
+
+    case GPGPU_REG_IRQ_ENABLE:
+        s->irq_enable = val & (GPGPU_IRQ_KERNEL_DONE |
+                               GPGPU_IRQ_DMA_DONE |
+                               GPGPU_IRQ_ERROR);
+        return;
+    case GPGPU_REG_IRQ_ACK:
+        s->irq_status &= ~(val & (GPGPU_IRQ_KERNEL_DONE |
+                                  GPGPU_IRQ_DMA_DONE |
+                                  GPGPU_IRQ_ERROR));
+        return;
+
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & UINT64_C(0xffffffff00000000)) |
+                                (uint32_t)val;
+        return;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        s->kernel.kernel_addr = ((uint64_t)(uint32_t)val << 32) |
+                                (uint32_t)s->kernel.kernel_addr;
+        return;
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        s->kernel.kernel_args = (s->kernel.kernel_args & UINT64_C(0xffffffff00000000)) |
+                                (uint32_t)val;
+        return;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        s->kernel.kernel_args = ((uint64_t)(uint32_t)val << 32) |
+                                (uint32_t)s->kernel.kernel_args;
+        return;
+    case GPGPU_REG_GRID_DIM_X:
+        s->kernel.grid_dim[0] = val;
+        return;
+    case GPGPU_REG_GRID_DIM_Y:
+        s->kernel.grid_dim[1] = val;
+        return;
+    case GPGPU_REG_GRID_DIM_Z:
+        s->kernel.grid_dim[2] = val;
+        return;
+    case GPGPU_REG_BLOCK_DIM_X:
+        s->kernel.block_dim[0] = val;
+        return;
+    case GPGPU_REG_BLOCK_DIM_Y:
+        s->kernel.block_dim[1] = val;
+        return;
+    case GPGPU_REG_BLOCK_DIM_Z:
+        s->kernel.block_dim[2] = val;
+        return;
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        s->kernel.shared_mem_size = val;
+        return;
+
+    case GPGPU_REG_DMA_SRC_LO:
+        s->dma.src_addr = (s->dma.src_addr & UINT64_C(0xffffffff00000000)) |
+                          (uint32_t)val;
+        return;
+    case GPGPU_REG_DMA_SRC_HI:
+        s->dma.src_addr = ((uint64_t)(uint32_t)val << 32) |
+                          (uint32_t)s->dma.src_addr;
+        return;
+    case GPGPU_REG_DMA_DST_LO:
+        s->dma.dst_addr = (s->dma.dst_addr & UINT64_C(0xffffffff00000000)) |
+                          (uint32_t)val;
+        return;
+    case GPGPU_REG_DMA_DST_HI:
+        s->dma.dst_addr = ((uint64_t)(uint32_t)val << 32) |
+                          (uint32_t)s->dma.dst_addr;
+        return;
+    case GPGPU_REG_DMA_SIZE:
+        s->dma.size = val;
+        return;
+    case GPGPU_REG_DMA_CTRL:
+        s->dma.ctrl = val & (GPGPU_DMA_START |
+                             GPGPU_DMA_DIR_FROM_VRAM |
+                             GPGPU_DMA_IRQ_ENABLE);
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "gpgpu: invalid ctrl write at 0x%" HWADDR_PRIx "\n",
+                  addr);
 }
 
 static const MemoryRegionOps gpgpu_ctrl_ops = {
@@ -51,23 +211,61 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
     },
 };
 
-/* TODO: Implement VRAM read */
 static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)size;
+    GPGPUState *s = opaque;
+
+    if (addr + size > s->vram_size) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gpgpu: VRAM read out of range at 0x%" HWADDR_PRIx
+                      " size %u\n", addr, size);
+        s->error_status |= GPGPU_ERR_VRAM_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return 0;
+    }
+
+    switch (size) {
+    case 1:
+        return s->vram_ptr[addr];
+    case 2:
+        return lduw_le_p(s->vram_ptr + addr);
+    case 4:
+        return ldl_le_p(s->vram_ptr + addr);
+    case 8:
+        return ldq_le_p(s->vram_ptr + addr);
+    }
+
     return 0;
 }
 
-/* TODO: Implement VRAM write */
 static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
-    (void)size;
+    GPGPUState *s = opaque;
+
+    if (addr + size > s->vram_size) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gpgpu: VRAM write out of range at 0x%" HWADDR_PRIx
+                      " size %u\n", addr, size);
+        s->error_status |= GPGPU_ERR_VRAM_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return;
+    }
+
+    switch (size) {
+    case 1:
+        s->vram_ptr[addr] = val;
+        return;
+    case 2:
+        stw_le_p(s->vram_ptr + addr, val);
+        return;
+    case 4:
+        stl_le_p(s->vram_ptr + addr, val);
+        return;
+    case 8:
+        stq_le_p(s->vram_ptr + addr, val);
+        return;
+    }
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {

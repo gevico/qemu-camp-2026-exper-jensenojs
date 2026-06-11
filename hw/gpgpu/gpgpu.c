@@ -92,6 +92,25 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
         return s->dma.ctrl;
     case GPGPU_REG_DMA_STATUS:
         return s->dma.status;
+
+    case GPGPU_REG_THREAD_ID_X:
+        return s->simt.thread_id[0];
+    case GPGPU_REG_THREAD_ID_Y:
+        return s->simt.thread_id[1];
+    case GPGPU_REG_THREAD_ID_Z:
+        return s->simt.thread_id[2];
+    case GPGPU_REG_BLOCK_ID_X:
+        return s->simt.block_id[0];
+    case GPGPU_REG_BLOCK_ID_Y:
+        return s->simt.block_id[1];
+    case GPGPU_REG_BLOCK_ID_Z:
+        return s->simt.block_id[2];
+    case GPGPU_REG_WARP_ID:
+        return s->simt.warp_id;
+    case GPGPU_REG_LANE_ID:
+        return s->simt.lane_id;
+    case GPGPU_REG_THREAD_MASK:
+        return s->simt.thread_mask;
     }
 
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -193,6 +212,34 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         s->dma.ctrl = val & (GPGPU_DMA_START |
                              GPGPU_DMA_DIR_FROM_VRAM |
                              GPGPU_DMA_IRQ_ENABLE);
+        return;
+
+    case GPGPU_REG_THREAD_ID_X:
+        s->simt.thread_id[0] = (uint32_t)val;
+        return;
+    case GPGPU_REG_THREAD_ID_Y:
+        s->simt.thread_id[1] = (uint32_t)val;
+        return;
+    case GPGPU_REG_THREAD_ID_Z:
+        s->simt.thread_id[2] = (uint32_t)val;
+        return;
+    case GPGPU_REG_BLOCK_ID_X:
+        s->simt.block_id[0] = (uint32_t)val;
+        return;
+    case GPGPU_REG_BLOCK_ID_Y:
+        s->simt.block_id[1] = (uint32_t)val;
+        return;
+    case GPGPU_REG_BLOCK_ID_Z:
+        s->simt.block_id[2] = (uint32_t)val;
+        return;
+    case GPGPU_REG_WARP_ID:
+        s->simt.warp_id = (uint32_t)val;
+        return;
+    case GPGPU_REG_LANE_ID:
+        s->simt.lane_id = (uint32_t)val;
+        return;
+    case GPGPU_REG_THREAD_MASK:
+        s->simt.thread_mask = (uint32_t)val;
         return;
     }
 

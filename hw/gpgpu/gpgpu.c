@@ -189,6 +189,35 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
         s->kernel.shared_mem_size = val;
         return;
 
+    case GPGPU_REG_DISPATCH:
+        /* 写 DISPATCH 寄存器触发 kernel 执行 */
+        if (!(s->global_ctrl & GPGPU_CTRL_ENABLE)) {
+            /* 设备未使能，忽略 */
+            return;
+        }
+        if (s->global_status & GPGPU_STATUS_BUSY) {
+            /* 设备正在执行，忽略 */
+            return;
+        }
+        /* 标记设备忙，清除就绪位 */
+        s->global_status |= GPGPU_STATUS_BUSY;
+        s->global_status &= ~GPGPU_STATUS_READY;
+
+        /* 同步执行 kernel（QEMU 单线程模拟，不需要异步） */
+        gpgpu_core_exec_kernel(s);
+
+        /* 执行完成：清除忙位，设就绪位 */
+        s->global_status &= ~GPGPU_STATUS_BUSY;
+        s->global_status |= GPGPU_STATUS_READY;
+
+        /* 触发 KERNEL_DONE 中断 */
+        s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+        if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+            pci_set_irq(&s->parent_obj, 1);
+            pci_set_irq(&s->parent_obj, 0);
+        }
+        return;
+
     case GPGPU_REG_DMA_SRC_LO:
         s->dma.src_addr = (s->dma.src_addr & UINT64_C(0xffffffff00000000)) |
                           (uint32_t)val;

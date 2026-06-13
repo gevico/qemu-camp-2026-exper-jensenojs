@@ -67,6 +67,187 @@ static inline void fpr_write(GPGPULane *lane, uint32_t rd, uint32_t val)
     lane->fpr[rd] = val;
 }
 
+static float32 minifloat_subnormal_to_float32(uint32_t sign, uint32_t mant,
+                                              uint32_t mant_bits,
+                                              int32_t bias)
+{
+    uint32_t hidden = 1u << mant_bits;
+    int32_t exp = 1 - bias;
+
+    while ((mant & hidden) == 0) {
+        mant <<= 1;
+        exp--;
+    }
+
+    return (sign << 31) | ((uint32_t)(exp + 127) << 23)
+           | ((mant & (hidden - 1)) << (23 - mant_bits));
+}
+
+static uint32_t fp32_to_minifloat_subnormal(uint32_t mant, int32_t unbiased,
+                                            uint32_t mant_bits, int32_t bias,
+                                            uint32_t max_mant)
+{
+    uint32_t sig = (1u << 23) | mant;
+    int32_t shift = unbiased + bias + (int32_t)mant_bits - 24;
+    uint32_t result;
+
+    if (shift >= 0) {
+        uint64_t shifted = (uint64_t)sig << shift;
+        result = shifted > max_mant ? max_mant : (uint32_t)shifted;
+    } else {
+        int32_t rshift = -shift;
+        result = rshift >= 32 ? 0 : sig >> rshift;
+    }
+
+    return result > max_mant ? max_mant : result;
+}
+
+static float32 e4m3_to_float32(uint32_t e4m3)
+{
+    uint32_t sign = (e4m3 >> 7) & 1;
+    uint32_t exp = (e4m3 >> 3) & 0xF;
+    uint32_t mant = e4m3 & 0x7;
+
+    if (e4m3 == 0x7F || e4m3 == 0xFF) {
+        return 0x7FC00000;
+    }
+    if (exp == 0) {
+        if (mant == 0) {
+            return sign << 31;
+        }
+        return minifloat_subnormal_to_float32(sign, mant, 3, 7);
+    }
+
+    return (sign << 31) | ((exp + 120) << 23) | (mant << 20);
+}
+
+static uint32_t float32_to_e4m3(float32 fp32)
+{
+    uint32_t sign = (fp32 >> 31) & 1;
+    uint32_t exp = (fp32 >> 23) & 0xFF;
+    uint32_t mant = fp32 & 0x7FFFFF;
+    uint32_t e4_exp;
+    uint32_t e4_mant;
+
+    if (exp == 0xFF) {
+        return mant != 0 ? 0x7F : ((sign << 7) | 0x7E);
+    }
+    if (exp == 0) {
+        return sign << 7;
+    }
+
+    int32_t target_exp = (int32_t)exp - 127 + 7;
+    if (target_exp <= 0) {
+        e4_mant = fp32_to_minifloat_subnormal(mant, (int32_t)exp - 127,
+                                              3, 7, 0x7);
+        return e4_mant == 0 ? (sign << 7) : ((sign << 7) | e4_mant);
+    }
+    if (target_exp > 15) {
+        return (sign << 7) | 0x7E;
+    }
+
+    e4_exp = (uint32_t)target_exp;
+    e4_mant = mant >> 20;
+    if (e4_exp == 15 && e4_mant == 7) {
+        return (sign << 7) | 0x7E;
+    }
+
+    return (sign << 7) | (e4_exp << 3) | e4_mant;
+}
+
+static float32 e5m2_to_float32(uint32_t e5m2)
+{
+    uint32_t sign = (e5m2 >> 7) & 1;
+    uint32_t exp = (e5m2 >> 2) & 0x1F;
+    uint32_t mant = e5m2 & 0x3;
+
+    if (exp == 0x1F) {
+        return (sign << 31) | (mant == 0 ? 0x7F800000 : 0x7FC00000);
+    }
+    if (exp == 0) {
+        if (mant == 0) {
+            return sign << 31;
+        }
+        return minifloat_subnormal_to_float32(sign, mant, 2, 15);
+    }
+
+    return (sign << 31) | ((exp + 112) << 23) | (mant << 21);
+}
+
+static uint32_t float32_to_e5m2(float32 fp32)
+{
+    uint32_t sign = (fp32 >> 31) & 1;
+    uint32_t exp = (fp32 >> 23) & 0xFF;
+    uint32_t mant = fp32 & 0x7FFFFF;
+    uint32_t e5_mant;
+
+    if (exp == 0xFF) {
+        return (sign << 7) | (mant == 0 ? 0x7C : 0x7D);
+    }
+    if (exp == 0) {
+        return sign << 7;
+    }
+
+    int32_t target_exp = (int32_t)exp - 127 + 15;
+    if (target_exp <= 0) {
+        e5_mant = fp32_to_minifloat_subnormal(mant, (int32_t)exp - 127,
+                                              2, 15, 0x3);
+        return e5_mant == 0 ? (sign << 7) : ((sign << 7) | e5_mant);
+    }
+    if (target_exp >= 31) {
+        return (sign << 7) | 0x7C;
+    }
+
+    return (sign << 7) | ((uint32_t)target_exp << 2) | (mant >> 21);
+}
+
+static float32 e2m1_to_float32(uint32_t e2m1)
+{
+    static const float32 table[16] = {
+        0x00000000, 0x3F000000, 0x3F800000, 0x3FC00000,
+        0x40000000, 0x40400000, 0x40800000, 0x40C00000,
+        0x80000000, 0xBF000000, 0xBF800000, 0xBFC00000,
+        0xC0000000, 0xC0400000, 0xC0800000, 0xC0C00000,
+    };
+
+    return table[e2m1 & 0xF];
+}
+
+static uint32_t float32_to_e2m1(float32 fp32)
+{
+    uint32_t sign = (fp32 >> 31) & 1;
+    uint32_t exp = (fp32 >> 23) & 0xFF;
+    uint32_t mant = fp32 & 0x7FFFFF;
+    uint32_t abs = fp32 & 0x7FFFFFFF;
+    uint32_t code;
+
+    if (exp == 0xFF && mant != 0) {
+        return (sign << 3) | 0x7;
+    }
+
+    if (abs > 0x40C00000) {
+        code = 0x7;
+    } else if (abs > 0x40A00000) {
+        code = 0x7;
+    } else if (abs > 0x40600000) {
+        code = 0x6;
+    } else if (abs > 0x40200000) {
+        code = 0x5;
+    } else if (abs > 0x3FE00000) {
+        code = 0x4;
+    } else if (abs > 0x3FA00000) {
+        code = 0x3;
+    } else if (abs > 0x3F400000) {
+        code = 0x2;
+    } else if (abs > 0x3E800000) {
+        code = 0x1;
+    } else {
+        code = 0x0;
+    }
+
+    return (sign << 3) | code;
+}
+
 /*
  * ============================================================================
  * exec_one_inst - 对一个 warp 的所有活跃 lane 执行一条指令
@@ -218,6 +399,36 @@ static void exec_one_inst(GPGPUState *s, GPGPUWarp *warp, uint32_t inst)
                     gpr_write(lane, rd, (uint32_t)result);
                     /* 恢复舍入模式 */
                     set_float_rounding_mode(old_rm, &lane->fp_status);
+                }
+                break;
+            case 0x22:
+                if (rs2 == 0) {
+                    fpr_write(lane, rd, (lane->fpr[rs1] & 0xFFFF) << 16);
+                } else if (rs2 == 1) {
+                    fpr_write(lane, rd, (lane->fpr[rs1] >> 16) & 0xFFFF);
+                }
+                break;
+            case 0x24:
+                if (rs2 == 0) {
+                    fpr_write(lane, rd, e4m3_to_float32(lane->fpr[rs1] & 0xFF));
+                } else if (rs2 == 1) {
+                    fpr_write(lane, rd, float32_to_e4m3(lane->fpr[rs1]));
+                } else if (rs2 == 2) {
+                    fpr_write(lane, rd, e5m2_to_float32(lane->fpr[rs1] & 0xFF));
+                } else if (rs2 == 3) {
+                    fpr_write(lane, rd, float32_to_e5m2(lane->fpr[rs1]));
+                }
+                break;
+            case 0x26:
+                if (rs2 == 0) {
+                    fpr_write(lane, rd, e2m1_to_float32(lane->fpr[rs1] & 0xF));
+                } else if (rs2 == 1) {
+                    fpr_write(lane, rd, float32_to_e2m1(lane->fpr[rs1]));
+                }
+                break;
+            case 0x78:
+                if (rs2 == 0) {
+                    fpr_write(lane, rd, lane->gpr[rs1]);
                 }
                 break;
             default:
